@@ -15,6 +15,7 @@ export default function OrderTab() {
   const [cart, setCart] = useState({})
   const [loading, setLoading] = useState(true)
   const [message, setMessage] = useState('')
+  const [checkingOut, setCheckingOut] = useState(false)
 
   useEffect(() => {
     fetchProducts()
@@ -62,50 +63,65 @@ export default function OrderTab() {
     })
   }
 
-  // 화면은 즉시 반영하고(낙관적 업데이트), 서버 동기화는 뒤에서 처리.
-  // 재고가 모자라서 서버가 거절하면 그때 되돌리고 알려줌.
+  // 장바구니 단계에서는 실제 재고를 건드리지 않음 (화면 표시용 잔여 수량만 계산).
+  // 계산완료를 눌렀을 때만 진짜 재고를 차감해서, 고르다가 새로고침해도 재고가 안전함.
+  function availableFor(product) {
+    if (product.stock === null) return Infinity
+    return product.stock - (cart[product.id] || 0)
+  }
+
   function increment(product) {
-    const unlimited = product.stock === null
-    if (!unlimited && product.stock <= 0) return
-
+    if (availableFor(product) <= 0) return
     setCart((c) => ({ ...c, [product.id]: (c[product.id] || 0) + 1 }))
-    if (!unlimited) {
-      setProducts((prev) =>
-        prev.map((p) => (p.id === product.id ? { ...p, stock: p.stock - 1 } : p))
-      )
-    }
     setMessage('')
-
-    if (!unlimited) {
-      supabase.rpc('sell_product', { p_id: product.id, p_qty: 1 }).then(({ data, error }) => {
-        if (error || data === false) {
-          setCart((c) => ({ ...c, [product.id]: Math.max(0, (c[product.id] || 0) - 1) }))
-          setMessage(product.name + '은 방금 품절됐어.')
-          fetchProducts()
-        }
-      })
-    }
   }
 
   function decrement(product) {
     const current = cart[product.id] || 0
     if (current <= 0) return
-    const unlimited = product.stock === null
-
     setCart((c) => ({ ...c, [product.id]: current - 1 }))
-    if (!unlimited) {
-      setProducts((prev) =>
-        prev.map((p) => (p.id === product.id ? { ...p, stock: p.stock + 1 } : p))
-      )
-      supabase.rpc('return_product', { p_id: product.id, p_qty: 1 }).then(({ error }) => {
-        if (error) setMessage('재고 복구 실패: ' + error.message)
-      })
-    }
   }
 
-  function checkout() {
-    setCart({})
-    setMessage('계산 완료. 다음 주문을 입력해줘.')
+  async function checkout() {
+    const entries = Object.entries(cart).filter(([, qty]) => qty > 0)
+    if (entries.length === 0) return
+    setCheckingOut(true)
+    setMessage('')
+
+    const failed = []
+    const nextCart = { ...cart }
+
+    for (const [productId, qty] of entries) {
+      const product = products.find((p) => p.id === productId)
+      if (!product) continue
+
+      if (product.stock === null) {
+        nextCart[productId] = 0
+        continue
+      }
+
+      const { data, error } = await supabase.rpc('sell_product', {
+        p_id: productId,
+        p_qty: qty
+      })
+
+      if (error || data === false) {
+        failed.push(product.name)
+        // 실패한 항목은 장바구니에 그대로 남겨서 다시 시도할 수 있게 함
+      } else {
+        nextCart[productId] = 0
+      }
+    }
+
+    setCart(nextCart)
+    await fetchProducts()
+    setCheckingOut(false)
+
+    if (failed.length > 0) {
+      setMessage(failed.join(', ') + ' 재고가 부족해서 처리 못했어. 수량을 줄이고 다시 시도해줘.')
+    } else {
+      setMessage('계산 완료. 다음 주문을 입력해줘.')
+    }
   }
 
   const total = products.reduce(
@@ -116,6 +132,7 @@ export default function OrderTab() {
   if (loading) return <p className="muted">불러오는 중...</p>
 
   const categories = [...new Set(products.map((p) => p.category))]
+  const hasItemsInCart = Object.values(cart).some((qty) => qty > 0)
 
   return (
     <div>
@@ -132,7 +149,8 @@ export default function OrderTab() {
               {items.map((p) => {
                 const qty = cart[p.id] || 0
                 const unlimited = p.stock === null
-                const outOfStock = !unlimited && p.stock <= 0
+                const remaining = unlimited ? null : p.stock
+                const canAddMore = availableFor(p) > 0
                 return (
                   <div className="item-row" key={p.id}>
                     <div className="item-info">
@@ -142,8 +160,8 @@ export default function OrderTab() {
                         {!unlimited && (
                           <span>
                             {' '}
-                            · 남은 수량 {p.stock}
-                            {outOfStock ? ' · 품절' : ''}
+                            · 남은 수량 {remaining}
+                            {remaining <= 0 ? ' · 품절' : ''}
                           </span>
                         )}
                       </div>
@@ -152,7 +170,7 @@ export default function OrderTab() {
                       <button
                         className="qty-button"
                         aria-label={p.name + ' 수량 줄이기'}
-                        disabled={qty <= 0}
+                        disabled={qty <= 0 || checkingOut}
                         onClick={() => decrement(p)}
                       >
                         -
@@ -161,7 +179,7 @@ export default function OrderTab() {
                       <button
                         className="qty-button"
                         aria-label={p.name + ' 수량 늘리기'}
-                        disabled={outOfStock}
+                        disabled={!canAddMore || checkingOut}
                         onClick={() => increment(p)}
                       >
                         +
@@ -180,8 +198,12 @@ export default function OrderTab() {
         <span className="total-value">{fmt(total)}</span>
       </div>
 
-      <button className="checkout-button" onClick={checkout}>
-        계산완료
+      <button
+        className="checkout-button"
+        onClick={checkout}
+        disabled={!hasItemsInCart || checkingOut}
+      >
+        {checkingOut ? '처리 중...' : '계산완료'}
       </button>
 
       {message && <p className="status-message">{message}</p>}
